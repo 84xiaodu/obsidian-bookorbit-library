@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing version tag to release (for example, 1.0.1)
+        description: Version to release (for example, 1.0.1)
         required: true
         type: string
 
@@ -21,6 +21,8 @@ jobs:
     outputs:
       version: ${{ steps.bundle.outputs.version }}
       archive: ${{ steps.bundle.outputs.archive }}
+      commit: ${{ steps.bundle.outputs.commit }}
+      create_tag: ${{ steps.source.outputs.create_tag }}
       publish: ${{ steps.source.outputs.publish }}
     steps:
       - name: Select source
@@ -30,6 +32,7 @@ jobs:
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
           PUSH_REF: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           tag="$REQUESTED_TAG"
           if [[ "$REF_TYPE" == tag ]]; then tag="$REF_NAME"; fi
@@ -38,7 +41,13 @@ jobs:
             exit 1
           fi
           if [[ -n "$tag" ]]; then
-            printf 'ref=refs/tags/%s\ntag=%s\npublish=true\n' "$tag" "$tag" >> "$GITHUB_OUTPUT"
+            ref="$PUSH_REF"
+            create_tag=false
+            if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+              remote_tag=$(git ls-remote --refs "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "refs/tags/$tag")
+              if [[ -n "$remote_tag" ]]; then ref="refs/tags/$tag"; else create_tag=true; fi
+            fi
+            printf 'ref=%s\ntag=%s\ncreate_tag=%s\npublish=true\n' "$ref" "$tag" "$create_tag" >> "$GITHUB_OUTPUT"
           else
             printf 'ref=%s\npublish=false\n' "$PUSH_REF" >> "$GITHUB_OUTPUT"
           fi
@@ -73,7 +82,8 @@ jobs:
           archive="bookorbit-library-$version.zip"
           (cd "release-$version" && zip -q -r "$GITHUB_WORKSPACE/$archive" bookorbit-library)
           unzip -tq "$archive"
-          printf 'version=%s\narchive=%s\n' "$version" "$archive" >> "$GITHUB_OUTPUT"
+          commit=$(git rev-parse HEAD)
+          printf 'version=%s\narchive=%s\ncommit=%s\n' "$version" "$archive" "$commit" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
@@ -102,15 +112,27 @@ jobs:
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ needs.package.outputs.version }}
           ARCHIVE: ${{ needs.package.outputs.archive }}
+          SOURCE_COMMIT: ${{ needs.package.outputs.commit }}
+          CREATE_TAG: ${{ needs.package.outputs.create_tag }}
         run: |
+          remote_tags=$(git ls-remote --tags "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "refs/tags/$VERSION" "refs/tags/$VERSION^{}")
+          remote_commit=$(awk 'NR == 1 || $2 ~ /\^\{\}$/ { commit = $1 } END { print commit }' <<< "$remote_tags")
+          tag_args=(--verify-tag)
+          if [[ -z "$remote_commit" && "$CREATE_TAG" == true ]]; then
+            tag_args=(--target "$SOURCE_COMMIT")
+          elif [[ "$remote_commit" != "$SOURCE_COMMIT" ]]; then
+            printf 'Expected tag %s to point to %s, found %s.\n' "$VERSION" "$SOURCE_COMMIT" "$remote_commit" >&2
+            exit 1
+          fi
           if release=$(gh release view "$VERSION" --json isDraft,assets); then
             if ! jq -e --arg archive "$ARCHIVE" 'any(.assets[]; .name == $archive)' <<< "$release" > /dev/null; then
               gh release upload "$VERSION" "$ARCHIVE"
             fi
             if jq -e '.isDraft' <<< "$release" > /dev/null; then
-              gh release edit "$VERSION" --draft=false
+              gh release edit "$VERSION" --draft=false --target "$SOURCE_COMMIT"
             fi
           else
-            gh release create "$VERSION" "$ARCHIVE" --verify-tag --title "BookOrbit Library $VERSION" --generate-notes
+            gh release create "$VERSION" "$ARCHIVE" "${tag_args[@]}" --title "BookOrbit Library $VERSION" --generate-notes \
+              --notes '下载安装包并解压，把整个 bookorbit-library 文件夹放入仓库的 .obsidian/plugins/。需要 Obsidian 桌面版 1.11.5 或更新版本。'
           fi
           gh release view "$VERSION" --json url,isDraft,assets
