@@ -1,4 +1,4 @@
-# BookOrbit Library 0.4.1
+# BookOrbit Library 1.0.0
 
 在 Obsidian 里浏览 BookOrbit 书库、阅读 EPUB 和 PDF，并保存摘录和标注。书架通过 BookOrbit 原生 API 同步。
 
