@@ -1,0 +1,116 @@
+name: Package and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to release (for example, 1.0.1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.bundle.outputs.version }}
+      archive: ${{ steps.bundle.outputs.archive }}
+      publish: ${{ steps.source.outputs.publish }}
+    steps:
+      - name: Select source
+        id: source
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          PUSH_REF: ${{ github.sha }}
+        run: |
+          tag="$REQUESTED_TAG"
+          if [[ "$REF_TYPE" == tag ]]; then tag="$REF_NAME"; fi
+          if [[ -n "$tag" && ! "$tag" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo 'A release tag must be a Semantic Version in x.y.z format.' >&2
+            exit 1
+          fi
+          if [[ -n "$tag" ]]; then
+            printf 'ref=refs/tags/%s\ntag=%s\npublish=true\n' "$tag" "$tag" >> "$GITHUB_OUTPUT"
+          else
+            printf 'ref=%s\npublish=false\n' "$PUSH_REF" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ steps.source.outputs.ref }}
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: reader-deps/package-lock.json
+
+      - name: Verify version, build and package
+        id: bundle
+        env:
+          EXPECTED_TAG: ${{ steps.source.outputs.tag }}
+        run: |
+          version=$(node -p 'require("./bookorbit-reading/manifest.json").version')
+          if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo 'The plugin manifest must contain a Semantic Version in x.y.z format.' >&2
+            exit 1
+          fi
+          if [[ -n "$EXPECTED_TAG" && "$EXPECTED_TAG" != "$version" ]]; then
+            printf 'Release tag %s points to plugin version %s.\n' "$EXPECTED_TAG" "$version" >&2
+            exit 1
+          fi
+          npm ci --prefix reader-deps
+          node build-bookorbit-reader.cjs
+          archive="bookorbit-library-$version.zip"
+          (cd "release-$version" && zip -q -r "$GITHUB_WORKSPACE/$archive" bookorbit-library)
+          unzip -tq "$archive"
+          printf 'version=%s\narchive=%s\n' "$version" "$archive" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: bookorbit-library-${{ steps.bundle.outputs.version }}
+          path: ${{ steps.bundle.outputs.archive }}
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    needs: package
+    if: needs.package.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ needs.package.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: bookorbit-library-${{ needs.package.outputs.version }}
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.package.outputs.version }}
+          ARCHIVE: ${{ needs.package.outputs.archive }}
+        run: |
+          if release=$(gh release view "$VERSION" --json isDraft,assets); then
+            if ! jq -e --arg archive "$ARCHIVE" 'any(.assets[]; .name == $archive)' <<< "$release" > /dev/null; then
+              gh release upload "$VERSION" "$ARCHIVE"
+            fi
+            if jq -e '.isDraft' <<< "$release" > /dev/null; then
+              gh release edit "$VERSION" --draft=false
+            fi
+          else
+            gh release create "$VERSION" "$ARCHIVE" --verify-tag --title "BookOrbit Library $VERSION" --generate-notes
+          fi
+          gh release view "$VERSION" --json url,isDraft,assets
