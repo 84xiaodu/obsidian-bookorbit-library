@@ -4,7 +4,7 @@
 
 ## 安装
 
-1. 从 GitHub Releases 下载 `bookorbit-library-1.0.0.zip`。[下载 1.0.0](https://github.com/84xiaodu/obsidian-bookorbit-library/releases/tag/1.0.0)
+1. 从 GitHub Releases 下载最新的 `bookorbit-library-*.zip`。[下载最新版](https://github.com/84xiaodu/obsidian-bookorbit-library/releases/latest)
 2. 解压，把整个 `bookorbit-library` 文件夹放到仓库的 `.obsidian/plugins/`。
 3. 重启 Obsidian，在 **设置 → 第三方插件**启用 **BookOrbit Library**，然后在插件设置里配置 BookOrbit 地址和认证方式。
 
