@@ -1,7 +1,0 @@
-{
-  "dependencies": {
-    "@zip.js/zip.js": "^2.25.0",
-    "esbuild": "^0.28.2",
-    "pdfjs-dist": "^5.4.624"
-  }
-}

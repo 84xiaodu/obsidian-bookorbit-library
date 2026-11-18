@@ -1,0 +1,14 @@
+{
+  "name": "bookorbit-library",
+  "private": true,
+  "scripts": {
+    "build": "node build-bookorbit-reader.cjs"
+  },
+  "dependencies": {
+    "@zip.js/zip.js": "^2.25.0",
+    "pdfjs-dist": "^5.4.624"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}

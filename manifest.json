@@ -1,9 +1,10 @@
 {
   "id": "bookorbit-library",
   "name": "BookOrbit Library",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "minAppVersion": "1.11.5",
   "description": "Browse BookOrbit, read EPUB and PDF, and sync highlights with your vault.",
-  "author": "BookOrbit Library contributors",
+  "author": "84xiaodu",
+  "authorUrl": "https://github.com/84xiaodu",
   "isDesktopOnly": true
 }

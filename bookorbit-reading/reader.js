@@ -274,23 +274,6 @@ function boundRects(rects) {
   return { x, y, width: right - x, height: bottom - y };
 }
 
-function pdfFactories(plugin) {
-  const adapter = plugin.app.vault.adapter;
-  const base = plugin.manifest.dir + "/runtime/";
-  const fetch = async (folder, name) => {
-    if (typeof name !== "string" || !/^[a-zA-Z0-9_.-]+$/.test(name) || name.startsWith(".")) throw new Error("无效的内置字体资源。");
-    return new Uint8Array(await adapter.readBinary(normalizePath(base + folder + "/" + name)));
-  };
-  return {
-    CMapReaderFactory: class {
-      async fetch({ name }) { return { cMapData: await fetch("cmaps", name + ".bcmap"), isCompressed: true, compressionType: 1 }; }
-    },
-    StandardFontDataFactory: class {
-      async fetch({ filename }) { return fetch("standard_fonts", filename); }
-    },
-  };
-}
-
 class PdfReader {
   constructor(view) {
     this.view = view;
@@ -301,10 +284,7 @@ class PdfReader {
   }
 
   async open(bytes, position) {
-    this.task = BUNDLE().getDocument({
-      data: new Uint8Array(bytes), useWorkerFetch: false, useWasm: false, isEvalSupported: false, enableXfa: false,
-      ...pdfFactories(this.view.plugin),
-    });
+    this.task = BUNDLE().openPdf(bytes);
     this.doc = await this.task.promise;
     if (this.view.closed) return;
     this.estimate = (await this.doc.getPage(1)).getViewport({ scale: 1 });

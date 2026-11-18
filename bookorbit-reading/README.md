@@ -1,11 +1,11 @@
-# BookOrbit Library 1.0.0
+# BookOrbit Library 使用手册
 
 在 Obsidian 里浏览 BookOrbit 书库、阅读 EPUB 和 PDF，并保存摘录和标注。书架通过 BookOrbit 原生 API 同步。
 
 ## 安装或升级
 
 1. 使用 Obsidian 桌面版 1.11.5 或更新版本。
-2. 解压，把 `bookorbit-library` 文件夹放到仓库的 `.obsidian/plugins/`。升级时，把压缩包里的文件及 `runtime/` 复制进现有同名插件目录。旧版连接配置可直接复用。
+2. 手动安装时解压 ZIP，把 `bookorbit-library` 文件夹放到仓库的 `.obsidian/plugins/`。升级时用新版压缩包内的程序文件覆盖同名文件。原有连接配置、下载书籍和阅读数据可以继续使用。
 3. 重启 Obsidian，在 **设置 → 第三方插件**启用 **BookOrbit Library**。
 4. 打开插件设置，填写平时访问 BookOrbit 的地址和下载文件夹，选择连接方式，点击 **保存并测试**。
 
@@ -32,7 +32,7 @@
 - 点标注卡片旁的垃圾桶可以删除本地标注，或将已同步的标注移到 BookOrbit 回收站。删除云端标注需要可写 API Key 或有权操作该标注的账号。
 - **导出笔记**生成普通 Markdown 摘录。**导出 Annotator**为已下载的文件生成带 `annotation-target` 和文本引用选择器的 Annotator 笔记。可以在 Annotator 中打开它重新定位文本。重复导出只追加新的标注，Annotator 中的后续修改由该笔记管理。相同摘录出现多次时，Annotator 可能需要人工定位。 [Annotator 项目说明](https://github.com/elias-sundqvist/obsidian-annotator)
 
-阅读位置保存在当前仓库的插件数据中。电子书内的脚本和外链资源在集成阅读器中被禁用。阅读器使用 Foliate、zip.js 和 PDF.js。许可证随包放在 `runtime/`。
+阅读位置保存在当前仓库的插件数据中。电子书内的脚本和外链资源在集成阅读器中被禁用。PDF 所需的 CMap 和备用字体随插件打包，可离线使用。项目许可和第三方组件说明见[仓库首页](https://github.com/84xiaodu/obsidian-bookorbit-library#许可证)。
 
 从 0.1.0 升级后，请在插件设置里重新保存连接并同步一次。原有下载文件会按书籍 ID 出现在新版书架里，历史 Markdown 书架仍可从仓库文件列表中访问。
 
