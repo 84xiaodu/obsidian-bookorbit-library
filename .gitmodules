@@ -1,0 +1,3 @@
+[submodule "reader-deps/foliate"]
+	path = reader-deps/foliate
+	url = https://github.com/johnfactotum/foliate-js.git
