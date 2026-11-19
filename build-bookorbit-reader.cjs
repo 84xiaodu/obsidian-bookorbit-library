@@ -47,6 +47,7 @@ const enginePatches = {
         if (start < 0 || stop <= start) throw new Error("Foliate source changed");
         contents = contents.slice(0, start) + contents.slice(stop);
         contents = contents.replace("|| book.isDirectory) book = await makeBook(book)", "|| book.isDirectory) throw new Error('Expected an EPUB book')");
+        contents = contents.replace("{ ...progress, tocItem, pageItem, cfi, range }", "{ ...progress, tocItem, pageItem, cfi, range, reason }");
       }
       if (path.basename(filename) === "epub.js") {
         const marker = "const result = new XMLSerializer().serializeToString(doc)";

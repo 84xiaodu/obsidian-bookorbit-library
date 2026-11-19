@@ -9,6 +9,26 @@ const COLORS = { yellow: "#FACC15", green: "#4ADE80", blue: "#60A5FA", pink: "#F
 const STYLES = { highlight: "高亮", underline: "下划线", strikethrough: "删除线", squiggly: "波浪线" };
 const BUNDLE = () => require("../reader-deps/reader-engines.mjs");
 const annotationOperations = new WeakSet();
+const progressOperations = new WeakMap();
+const progressWrites = new WeakMap();
+
+function samePosition(left, right) {
+  left = left?.cfi || left;
+  right = right?.cfi || right;
+  if (left === right) return true;
+  if (!left || !right || typeof left !== "object" || typeof right !== "object") return false;
+  if ("page" in left || "page" in right) return left.page === right.page && left.offset === right.offset;
+  return left.fraction === right.fraction;
+}
+
+function cloudPosition(progress, format, local) {
+  if (format === "pdf") {
+    if (progress.page == null) return null;
+    return local?.page === progress.page ? local : { page: progress.page, offset: 0 };
+  }
+  if (progress.cfi) return { cfi: progress.cfi, fraction: progress.percentage / 100 };
+  return progress.percentage > 0 ? { fraction: progress.percentage / 100 } : null;
+}
 
 function color(value) {
   if (Object.hasOwn(COLORS, value)) return COLORS[value];
@@ -194,7 +214,7 @@ class EpubReader {
     element.addEventListener("relocate", ({ detail }) => {
       const label = detail.tocItem?.label;
       const progress = Number.isFinite(detail.fraction) ? Math.round(detail.fraction * 100) + "%" : "";
-      view.setLocation([label, progress].filter(Boolean).join(" · "), detail.cfi);
+      view.setLocation([label, progress].filter(Boolean).join(" · "), detail.cfi, detail.fraction * 100, detail.reason !== "anchor");
       view.selectionChanged(null);
     });
     await element.open(book);
@@ -205,8 +225,35 @@ class EpubReader {
     element.renderer?.addEventListener("wheel", this.wheel, { passive: false });
     this.setFlow(view.flow);
     view.setContents(book.toc || []);
-    await element.init({ lastLocation: typeof position === "string" ? position : null, showTextStart: true });
+    const target = this.positionTarget(position);
+    try {
+      if (target === 0) await element.goTo(0);
+      else await element.init({ lastLocation: target, showTextStart: true });
+    } catch (error) {
+      if (target == null) throw error;
+      await element.init({ lastLocation: typeof target === "string" ? this.fractionTarget(position) : null, showTextStart: true });
+    }
     this.refreshMarks();
+  }
+
+  fractionTarget(position) {
+    return Number.isFinite(position?.fraction) ? { fraction: position.fraction } : null;
+  }
+
+  positionTarget(position) {
+    const cfi = typeof position === "string" ? position : position?.cfi;
+    if (!cfi) return this.fractionTarget(position);
+    const resolved = this.element.resolveNavigation(cfi);
+    if (!this.element.book.sections[resolved?.index]) return this.fractionTarget(position);
+    return cfi.includes("!") ? cfi : resolved.index;
+  }
+
+  async goToPosition(position) {
+    const target = this.positionTarget(position);
+    if (target == null) return;
+    const result = await this.element.goTo(target);
+    const fallback = this.fractionTarget(position);
+    if (!result && typeof target === "string" && fallback) await this.element.goTo(fallback);
   }
 
   updateAppearance() {
@@ -387,7 +434,7 @@ class PdfReader {
     const y = this.area.scrollTop;
     const position = this.currentPosition();
     this.page = position.page;
-    this.view.setLocation(`${this.page} / ${this.doc.numPages}`, position);
+    this.view.setLocation(`${this.page} / ${this.doc.numPages}`, position, this.page / this.doc.numPages * 100);
     const first = Math.max(0, this.indexAt(y) - 1);
     const last = Math.min(this.entries.length - 1, this.indexAt(y + this.area.clientHeight) + 1);
     for (const entry of [...this.rendering]) {
@@ -744,6 +791,9 @@ class ReaderView extends ItemView {
     menu.addItem(item => item.setTitle("恢复默认").setIcon("rotate-ccw").setDisabled(!this.engine).onClick(() => this.zoom(0)));
     menu.addSeparator();
     menu.addItem(item => item.setTitle("目录与标注").setIcon("panel-right").onClick(() => this.openPanel()));
+    if (this.progressRecord) menu.addItem(item => item.setTitle("同步阅读进度").setIcon("refresh-cw")
+      .setDisabled(!this.api?.readProgress || !this.engine || this.syncingProgress)
+      .onClick(() => this.syncProgress(true)));
     if (this.onlineUrl) menu.addItem(item => item.setTitle("在 BookOrbit 网页打开").setIcon("external-link")
       .onClick(() => this.root.ownerDocument.defaultView.open(this.onlineUrl, "_blank", "noopener,noreferrer")));
     if (event.clientX || event.clientY) menu.showAtMouseEvent(event);
@@ -759,7 +809,7 @@ class ReaderView extends ItemView {
     this.selectionChanged(null);
     this.flow = flow;
     this.engine?.setFlow(flow);
-    if (typeof anchor === "string") void this.engine?.goTo(anchor).catch(error => this.fail(error));
+    if (anchor && this.engine) void this.restoreProgress(anchor).catch(error => this.fail(error));
     this.plugin.app.workspace.requestSaveLayout?.();
   }
 
@@ -786,6 +836,10 @@ class ReaderView extends ItemView {
       this.state = plugin.reading.book(this.settings, id);
       const slot = linkedFile || this.format || "unknown";
       this.slot = String(slot);
+      if (linkedFile && (!local || alternatives.length <= 1)) {
+        const records = this.state.progress ??= {};
+        this.progressRecord = records[this.slot] ??= {};
+      }
       if (this.settings.endpoint && entry) {
         const web = this.settings.endpoint.replace(/\/api\/v1$/, "");
         this.onlineUrl = linkedFile ? `${web}/read/${id}/${linkedFile}` : `${web}/book/${id}`;
@@ -794,14 +848,18 @@ class ReaderView extends ItemView {
       this.renderSide();
       if (this.annotationApi) void this.sync(false);
       if (!["epub", "pdf"].includes(this.format)) throw new Error("集成阅读器支持 EPUB 与 PDF。可从侧栏打开 BookOrbit 网页。");
+      const progress = this.resumeProgress();
       const bytes = local
         ? await plugin.app.vault.adapter.readBinary(local.path)
         : await plugin.connected().readBook(book);
+      await progress;
       if (this.closed) return;
       this.pageArea.empty();
       this.engine = this.format === "epub" ? new EpubReader(this) : new PdfReader(this);
       await this.engine.open(bytes, this.state.positions[this.slot]);
       if (this.closed) return;
+      this.progressReady = true;
+      if (this.progressRecord?.pending) this.scheduleProgress();
       this.previous.disabled = this.next.disabled = false;
       this.renderSide();
     } catch (error) {
@@ -815,12 +873,14 @@ class ReaderView extends ItemView {
 
   async onClose() {
     this.closed = true;
+    clearTimeout(this.progressTimer);
     this.engine?.close();
     this.plugin.readerClosed?.(this);
     if (this.positionTimer) {
       clearTimeout(this.positionTimer);
       await this.persist().catch(error => new Notice(error.message, 8500));
     }
+    if (this.progressRecord?.pending && !this.progressWriteDenied) void this.syncProgress();
   }
 
   marks() {
@@ -843,17 +903,134 @@ class ReaderView extends ItemView {
 
   setContents(items) { this.contents = items; this.renderSide(); }
 
-  setLocation(label, position) {
+  setLocation(label, position, percentage, moved = true) {
     if (this.location.textContent !== label) this.location.textContent = label;
-    const previous = this.state.positions[this.slot];
-    if (position == null || this.closed || previous === position
-        || (typeof position === "object" && previous?.page === position.page && previous.offset === position.offset)) return;
+    if (position == null || this.closed) return;
+    const previous = this.viewPosition;
+    this.viewPosition = position;
+    this.viewPercentage = percentage;
+    if (samePosition(previous, position)) return;
+    const pageMoved = this.format !== "pdf" || position.page !== previous?.page;
+    const queued = this.progressReady && !this.positionRestores && moved && pageMoved && this.queueProgress();
+    if (queued) this.scheduleProgress();
+    if (!queued && samePosition(this.state.positions[this.slot], position)) return;
     this.state.positions[this.slot] = position;
     clearTimeout(this.positionTimer);
     this.positionTimer = setTimeout(() => {
       this.positionTimer = null;
       void this.persist().catch(error => this.fail(error));
     }, 650);
+  }
+
+  queueProgress() {
+    const position = this.viewPosition;
+    if (!this.progressRecord || !Number.isFinite(this.viewPercentage)) return false;
+    const valid = this.format === "pdf" ? Number.isSafeInteger(position?.page) && position.page > 0
+      : typeof position === "string" && position.startsWith("epubcfi(") && position.length <= 2000;
+    if (!valid) return false;
+    this.progressRecord.pending = {
+      position, percentage: Math.max(0, Math.min(100, this.viewPercentage)), editedAt: Date.now(),
+    };
+    return true;
+  }
+
+  scheduleProgress() {
+    clearTimeout(this.progressTimer);
+    if (this.api?.readProgress && !this.progressWriteDenied) {
+      this.progressTimer = setTimeout(() => void this.syncProgress(), 1800);
+    }
+  }
+
+  async resumeProgress() {
+    if (!this.progressRecord || !this.api?.readProgress) return;
+    const deadline = AbortSignal.timeout(2200);
+    const expiry = new Promise(resolve => deadline.addEventListener("abort", resolve, { once: true }));
+    await Promise.race([expiry, this.exchangeProgress({ resume: true, signal: deadline }).catch(() => {})]);
+  }
+
+  async restoreProgress(position) {
+    this.positionRestores = (this.positionRestores || 0) + 1;
+    try {
+      if (this.format === "pdf") await this.engine.goTo(position.page, { offset: position.offset });
+      else await this.engine.goToPosition(position);
+    } finally {
+      this.positionRestores--;
+    }
+  }
+
+  async syncProgress(manual = false) {
+    if (!this.progressRecord || !this.api?.readProgress) return;
+    if (this.syncingProgress) { this.resyncProgress = true; return; }
+    this.syncingProgress = true;
+    try {
+      const before = this.viewPosition;
+      const position = await this.exchangeProgress({ manual, signal: AbortSignal.timeout(8000) });
+      if (manual && !this.closed && this.engine && samePosition(before, this.viewPosition)) {
+        if (position && !samePosition(position, this.viewPosition)) await this.restoreProgress(position);
+        new Notice("阅读进度已同步。");
+      }
+    } catch (error) {
+      if (error.status === 403 && this.progressRecord.pending) {
+        if (!this.progressWriteDenied || manual) {
+          if (!this.closed) new Notice("阅读进度已留在本地。请检查 BookOrbit 账号或 API Key 的读写权限。");
+        }
+        this.progressWriteDenied = true;
+      } else if (manual && !this.closed) new Notice("无法同步阅读进度。 " + error.message);
+    } finally {
+      this.syncingProgress = false;
+      if (this.resyncProgress) {
+        this.resyncProgress = false;
+        if (this.progressRecord.pending && !this.progressWriteDenied) {
+          if (this.closed) void this.syncProgress();
+          else this.scheduleProgress();
+        }
+      }
+    }
+  }
+
+  async exchangeProgress({ resume = false, manual = false, signal }) {
+    const record = this.progressRecord;
+    if (!resume && !manual && (!record.pending || this.progressWriteDenied)) return null;
+    const remember = async (position, pending) => {
+      if (!pending && samePosition(this.state.positions[this.slot], position)) return position;
+      if (pending) delete record.pending;
+      this.state.positions[this.slot] = position;
+      await this.persist();
+      return position;
+    };
+    const queued = (progressOperations.get(record) ?? Promise.resolve()).catch(() => {}).then(async () => {
+      signal.throwIfAborted();
+      const remote = await this.api.readProgress(this.fileId, signal);
+      signal.throwIfAborted();
+      const position = cloudPosition(remote, this.format, this.state.positions[this.slot]);
+      let pending = record.pending;
+      const previousWrite = progressWrites.get(record);
+      const ownUpdate = previousWrite && (!previousWrite.updatedAt || remote.updatedAt === previousWrite.updatedAt)
+        && (this.format === "pdf" ? remote.page === previousWrite.position.page : remote.cfi === previousWrite.position);
+      const clockOffset = pending && ownUpdate ? Math.max(remote.clockOffset, remote.updatedAt - pending.editedAt) : remote.clockOffset;
+      if (position && (!pending || remote.updatedAt > pending.editedAt + clockOffset)) {
+        return remember(position, pending);
+      }
+      if (resume) return null;
+      if (!pending && manual && this.queueProgress()) pending = record.pending;
+      if (!pending) return null;
+      await this.persist();
+      signal.throwIfAborted();
+      const result = await this.api.writeProgress(this.fileId, this.format, pending, clockOffset, signal);
+      this.progressWriteDenied = false;
+      if (result.status === "saved") {
+        progressWrites.set(record, { updatedAt: result.progress?.updatedAt, position: pending.position });
+      }
+      if (record.pending !== pending) return null;
+      delete record.pending;
+      const newer = result.status === "superseded" && cloudPosition(result.progress, this.format, this.state.positions[this.slot]);
+      if (newer) this.state.positions[this.slot] = newer;
+      await this.persist();
+      return newer || null;
+    });
+    progressOperations.set(record, queued);
+    try { return await queued; }
+    finally { if (progressOperations.get(record) === queued) progressOperations.delete(record); }
   }
 
   async persist() {
