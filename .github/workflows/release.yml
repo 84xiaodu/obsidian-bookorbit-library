@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
     tags: ['[0-9]+.[0-9]+.[0-9]+']
+  pull_request:
+    branches: [main]
   workflow_dispatch:
     inputs:
       tag:
@@ -61,14 +63,18 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: reader-deps/package-lock.json
+          cache-dependency-path: |
+            package-lock.json
+            reader-deps/package-lock.json
 
       - name: Verify version, build and package
         id: bundle
         env:
           EXPECTED_TAG: ${{ steps.source.outputs.tag }}
         run: |
-          version=$(node -p 'require("./bookorbit-reading/manifest.json").version')
+          manifest=manifest.json
+          if [[ ! -f "$manifest" ]]; then manifest=bookorbit-reading/manifest.json; fi
+          version=$(node -p 'require("./" + process.argv[1]).version' "$manifest")
           if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo 'The plugin manifest must contain a Semantic Version in x.y.z format.' >&2
             exit 1
@@ -77,18 +83,33 @@ jobs:
             printf 'Release tag %s points to plugin version %s.\n' "$EXPECTED_TAG" "$version" >&2
             exit 1
           fi
-          npm ci --prefix reader-deps
-          node build-bookorbit-reader.cjs
+          marketplace=false
+          if [[ "$manifest" == manifest.json ]]; then
+            npm ci
+            npm run build
+            plugin="release-$version/bookorbit-library"
+            mkdir -p "$plugin"
+            cp main.js manifest.json styles.css LICENSE "$plugin/"
+            cp bookorbit-reading/README.md "$plugin/README.md"
+            marketplace=true
+          else
+            npm ci --prefix reader-deps
+            node build-bookorbit-reader.cjs
+          fi
           archive="bookorbit-library-$version.zip"
           (cd "release-$version" && zip -q -r "$GITHUB_WORKSPACE/$archive" bookorbit-library)
           unzip -tq "$archive"
           commit=$(git rev-parse HEAD)
-          printf 'version=%s\narchive=%s\ncommit=%s\n' "$version" "$archive" "$commit" >> "$GITHUB_OUTPUT"
+          printf 'version=%s\narchive=%s\ncommit=%s\nmarketplace=%s\n' "$version" "$archive" "$commit" "$marketplace" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: bookorbit-library-${{ steps.bundle.outputs.version }}
-          path: ${{ steps.bundle.outputs.archive }}
+          path: |
+            ${{ steps.bundle.outputs.archive }}
+            ${{ steps.bundle.outputs.marketplace == 'true' && 'main.js' || '' }}
+            ${{ steps.bundle.outputs.marketplace == 'true' && 'manifest.json' || '' }}
+            ${{ steps.bundle.outputs.marketplace == 'true' && 'styles.css' || '' }}
           if-no-files-found: error
           compression-level: 0
 
@@ -124,15 +145,21 @@ jobs:
             printf 'Expected tag %s to point to %s, found %s.\n' "$VERSION" "$SOURCE_COMMIT" "$remote_commit" >&2
             exit 1
           fi
+          assets=("$ARCHIVE")
+          if [[ -f manifest.json ]]; then assets+=(main.js manifest.json styles.css); fi
           if release=$(gh release view "$VERSION" --json isDraft,assets); then
-            if ! jq -e --arg archive "$ARCHIVE" 'any(.assets[]; .name == $archive)' <<< "$release" > /dev/null; then
-              gh release upload "$VERSION" "$ARCHIVE"
-            fi
+            missing=()
+            for asset in "${assets[@]}"; do
+              if ! jq -e --arg asset "$asset" 'any(.assets[]; .name == $asset)' <<< "$release" > /dev/null; then
+                missing+=("$asset")
+              fi
+            done
+            if ((${#missing[@]})); then gh release upload "$VERSION" "${missing[@]}"; fi
             if jq -e '.isDraft' <<< "$release" > /dev/null; then
               gh release edit "$VERSION" --draft=false --target "$SOURCE_COMMIT"
             fi
           else
-            gh release create "$VERSION" "$ARCHIVE" "${tag_args[@]}" --title "BookOrbit Library $VERSION" --generate-notes \
+            gh release create "$VERSION" "${assets[@]}" "${tag_args[@]}" --title "BookOrbit Library $VERSION" --generate-notes \
               --notes '下载安装包并解压，把整个 bookorbit-library 文件夹放入仓库的 .obsidian/plugins/。需要 Obsidian 桌面版 1.11.5 或更新版本。'
           fi
           gh release view "$VERSION" --json url,isDraft,assets

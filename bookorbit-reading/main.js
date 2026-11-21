@@ -97,7 +97,8 @@ function apiRequest(url, { token, body, method = body === undefined ? "GET" : "P
           reject(new Error("服务器传输中断，请重试。"));
           return;
         }
-        resolve({ status, bytes: Buffer.concat(chunks, received), mime: String(response.headers["content-type"] || "").split(";")[0] });
+        resolve({ status, bytes: Buffer.concat(chunks, received), date: response.headers.date,
+          mime: String(response.headers["content-type"] || "").split(";")[0] });
       });
     });
     request.setTimeout(35_000, () => request.destroy(new Error("连接超时，请检查这台电脑是否能访问 BookOrbit。")));
@@ -112,6 +113,18 @@ function parseJson(bytes) {
   } catch {
     throw new Error("BookOrbit 未返回 JSON。请检查服务器地址和反向代理的登录设置。");
   }
+}
+
+function normalizeReadingProgress(row, modern) {
+  const text = modern ? row?.text : row;
+  if (!text || !Number.isFinite(row.percentage)) throw new Error("BookOrbit 返回了无法识别的阅读进度。");
+  const page = modern ? text.page : text.pageNumber;
+  return {
+    cfi: typeof text.cfi === "string" && /^epubcfi\(.+\)$/.test(text.cfi) && text.cfi.length <= 2000 ? text.cfi : null,
+    page: Number.isSafeInteger(page) && page > 0 ? page : null,
+    percentage: Math.max(0, Math.min(100, row.percentage)),
+    updatedAt: Date.parse(row.updatedAt) || 0,
+  };
 }
 
 function albumBook(row) {
@@ -189,6 +202,47 @@ class BookOrbitApi {
 
   async json(route, body) {
     return parseJson((await this.request(route, { body })).bytes);
+  }
+
+  async readProgress(fileId, signal) {
+    const started = Date.now();
+    if (this.progressProtocol !== "legacy") {
+      try {
+        const { bytes, date } = await this.request(`/reading-progress?fileId=${fileId}`, { signal });
+        const body = parseJson(bytes);
+        const row = Array.isArray(body?.items) && body.items.find(item => item?.fileId === fileId);
+        const progress = normalizeReadingProgress(row, true);
+        this.progressProtocol = "modern";
+        return { ...progress, clockOffset: this.progressClockOffset(date, started) };
+      } catch (error) {
+        if (this.progressProtocol === "modern" || ![404, 405].includes(error.status)) throw error;
+      }
+    }
+    const fallbackStarted = Date.now();
+    const { bytes, date } = await this.request(`/books/files/${fileId}/progress`, { signal });
+    const progress = normalizeReadingProgress(parseJson(bytes), false);
+    this.progressProtocol = "legacy";
+    return { ...progress, clockOffset: this.progressClockOffset(date, fallbackStarted) };
+  }
+
+  progressClockOffset(date, started) {
+    const serverTime = Date.parse(date);
+    return Number.isFinite(serverTime) ? Math.round(serverTime + 500 - (started + Date.now()) / 2) : 0;
+  }
+
+  async writeProgress(fileId, format, pending, clockOffset, signal) {
+    const { position, percentage, editedAt } = pending;
+    const text = format === "pdf" ? { page: position.page } : { cfi: position };
+    if (this.progressProtocol === "legacy") {
+      const body = format === "pdf" ? { pageNumber: text.page, percentage } : { cfi: text.cfi, percentage };
+      await this.request(`/books/files/${fileId}/progress`, { body, signal });
+      return { status: "saved" };
+    }
+    const body = { writes: [{ fileId, kind: "text", percentage, text, editedAt: new Date(editedAt + clockOffset).toISOString() }] };
+    const response = parseJson((await this.request("/reading-progress", { method: "PUT", body, signal })).bytes);
+    const result = Array.isArray(response?.results) && response.results.find(item => item?.fileId === fileId);
+    if (!["saved", "superseded"].includes(result?.status)) throw new Error("BookOrbit 未确认阅读进度已保存。");
+    return { status: result.status, progress: normalizeReadingProgress(result.progress, true) };
   }
 
   async page(page, size) {

@@ -1,9 +1,40 @@
 const fs = require("node:fs/promises");
 const path = require("node:path");
-const esbuild = require("./reader-deps/node_modules/esbuild");
+const esbuild = require("esbuild");
 const source = path.join(__dirname, "bookorbit-reading");
-const deps = path.join(__dirname, "reader-deps");
-const pdf = path.join(deps, "node_modules", "pdfjs-dist");
+const modules = path.join(__dirname, "node_modules");
+const pdf = path.join(modules, "pdfjs-dist");
+const foliate = path.join(__dirname, "vendor", "foliate");
+
+async function encodePdfAssets(folder, pattern) {
+  const directory = path.join(pdf, folder);
+  const files = (await fs.readdir(directory)).filter(name => pattern.test(name)).sort();
+  if (!files.length) throw new Error("Missing PDF assets in " + folder);
+  const entries = await Promise.all(files.map(async name => [
+    name, (await fs.readFile(path.join(directory, name))).toString("base64"),
+  ]));
+  return Object.fromEntries(entries);
+}
+
+const pdfAssets = {
+  name: "embedded-pdf-assets",
+  setup(build) {
+    build.onResolve({ filter: /^bookorbit:pdf-assets$/ }, args => ({
+      path: args.path,
+      namespace: "bookorbit-pdf-assets",
+    }));
+    build.onLoad({ filter: /.*/, namespace: "bookorbit-pdf-assets" }, async () => {
+      const [cMaps, standardFonts] = await Promise.all([
+        encodePdfAssets("cmaps", /\.bcmap$/),
+        encodePdfAssets("standard_fonts", /\.(?:pfb|ttf)$/),
+      ]);
+      return {
+        contents: `export const cMaps = ${JSON.stringify(cMaps)};\nexport const standardFonts = ${JSON.stringify(standardFonts)};`,
+        loader: "js",
+      };
+    });
+  },
+};
 
 const enginePatches = {
   name: "isolated-book-rendering",
@@ -16,6 +47,7 @@ const enginePatches = {
         if (start < 0 || stop <= start) throw new Error("Foliate source changed");
         contents = contents.slice(0, start) + contents.slice(stop);
         contents = contents.replace("|| book.isDirectory) book = await makeBook(book)", "|| book.isDirectory) throw new Error('Expected an EPUB book')");
+        contents = contents.replace("{ ...progress, tocItem, pageItem, cfi, range }", "{ ...progress, tocItem, pageItem, cfi, range, reason }");
       }
       if (path.basename(filename) === "epub.js") {
         const marker = "const result = new XMLSerializer().serializeToString(doc)";
@@ -48,29 +80,32 @@ const enginePatches = {
 };
 
 async function main() {
-  const { version } = JSON.parse(await fs.readFile(path.join(source, "manifest.json"), "utf8"));
-  const buildDir = path.join(__dirname, "release-" + version, "bookorbit-library");
-  const runtime = path.join(buildDir, "runtime");
-  await fs.mkdir(runtime, { recursive: true });
+  const licenses = [
+    ["BookOrbit Library", path.join(__dirname, "LICENSE")],
+    ["Foliate.js", path.join(foliate, "LICENSE")],
+    ["PDF.js", path.join(pdf, "LICENSE")],
+    ["PDF CMaps", path.join(pdf, "cmaps", "LICENSE")],
+    ["Foxit fonts", path.join(pdf, "standard_fonts", "LICENSE_FOXIT")],
+    ["Liberation Sans fonts", path.join(pdf, "standard_fonts", "LICENSE_LIBERATION")],
+    ["zip.js", path.join(modules, "@zip.js", "zip.js", "LICENSE")],
+  ];
+  const notices = await Promise.all(licenses.map(async ([name, file]) => {
+    const license = (await fs.readFile(file, "utf8")).replaceAll("\r\n", "\n").replaceAll("*/", "* /").trimEnd();
+    return `/*! ${name}\n${license}\n*/`;
+  }));
   await esbuild.build({
+    absWorkingDir: __dirname,
     entryPoints: [path.join(source, "main.js")],
-    outfile: path.join(buildDir, "main.js"),
+    outfile: path.join(__dirname, "main.js"),
     format: "cjs",
     bundle: true,
     platform: "browser",
     target: "chrome139",
     external: ["obsidian", "http", "https", "crypto", "fs", "path"],
+    banner: { js: notices.join("\n") },
     legalComments: "inline",
-    plugins: [enginePatches],
+    plugins: [enginePatches, pdfAssets],
   });
-  for (const file of ["manifest.json", "styles.css", "README.md"]) {
-    await fs.copyFile(path.join(source, file), path.join(buildDir, file));
-  }
-  for (const folder of ["cmaps", "standard_fonts"]) {
-    await fs.cp(path.join(pdf, folder), path.join(runtime, folder), { recursive: true });
-  }
-  await fs.copyFile(path.join(pdf, "LICENSE"), path.join(runtime, "PDF.js-LICENSE.txt"));
-  await fs.copyFile(path.join(deps, "foliate", "LICENSE"), path.join(runtime, "Foliate-LICENSE.txt"));
-  await fs.copyFile(path.join(deps, "node_modules", "@zip.js", "zip.js", "LICENSE"), path.join(runtime, "zip.js-LICENSE.txt"));
+  await fs.copyFile(path.join(source, "styles.css"), path.join(__dirname, "styles.css"));
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });
