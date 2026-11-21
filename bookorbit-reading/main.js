@@ -46,6 +46,24 @@ function secretKey(settings) {
   return "bookorbit-shelf-" + digest(JSON.stringify([settings.endpoint, settings.mode, settings.accountId]));
 }
 
+function retryAfterDelay(value, date) {
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (/^\d+$/.test(raw)) {
+    const milliseconds = Number(raw) * 1000;
+    if (Number.isSafeInteger(milliseconds)) return Math.max(1000, milliseconds);
+  }
+  const deadline = Date.parse(raw);
+  const serverTime = Date.parse(date);
+  return Number.isFinite(deadline)
+    ? Math.max(1000, deadline - (Number.isFinite(serverTime) ? serverTime : Date.now()))
+    : 60_000;
+}
+
+function rateLimitError(retryAt) {
+  const seconds = Math.max(1, Math.ceil((retryAt - Date.now()) / 1000));
+  return Object.assign(new Error(`BookOrbit 请求过于频繁，请在约 ${seconds} 秒后重试。`), { status: 429, retryAt });
+}
+
 function apiRequest(url, { token, body, method = body === undefined ? "GET" : "POST", accept = "application/json",
   limit = 12 * 1024 * 1024, signal }) {
   const transport = url.startsWith("https:") ? https : http;
@@ -62,11 +80,14 @@ function apiRequest(url, { token, body, method = body === undefined ? "GET" : "P
       const status = response.statusCode;
       if (status < 200 || status >= 300) {
         response.destroy();
+        if (status === 429) {
+          reject(rateLimitError(Date.now() + retryAfterDelay(response.headers["retry-after"], response.headers.date)));
+          return;
+        }
         const explanations = {
           401: "BookOrbit 认证失败。请检查 API Key，或在设置中重新登录。",
           403: "BookOrbit 拒绝访问。请检查账号权限，以及 API Key 的书库与下载权限。",
           404: "BookOrbit 找不到此接口或书籍。请核对服务器地址与版本，再同步书库。",
-          429: "BookOrbit 请求过于频繁，请稍后重试。",
         };
         const message = explanations[status] || (status >= 300 && status < 400
           ? "服务器返回了重定向。请使用 BookOrbit 的最终访问地址，并检查反向代理。"
@@ -187,16 +208,28 @@ class BookOrbitApi {
   }
 
   async request(route, options = {}) {
-    const send = token => apiRequest(this.endpoint + route, {
-      ...options, token, signal: options.signal ? AbortSignal.any([options.signal, this.signal]) : this.signal,
-    });
-    if (this.mode === "key") return send(this.secret);
-    const token = this.accessToken || await this.refresh();
+    const checkRateLimit = () => {
+      if (this.rateLimitUntil > Date.now()) throw rateLimitError(this.rateLimitUntil);
+    };
+    const send = async token => {
+      checkRateLimit();
+      return apiRequest(this.endpoint + route, {
+        ...options, token, signal: options.signal ? AbortSignal.any([options.signal, this.signal]) : this.signal,
+      });
+    };
+    checkRateLimit();
     try {
-      return await send(token);
+      if (this.mode === "key") return await send(this.secret);
+      const token = this.accessToken || await this.refresh();
+      try {
+        return await send(token);
+      } catch (error) {
+        if (error.status !== 401) throw error;
+        return await send(await this.refresh(token));
+      }
     } catch (error) {
-      if (error.status !== 401) throw error;
-      return send(await this.refresh(token));
+      if (error.status === 429) this.rateLimitUntil = Math.max(this.rateLimitUntil || 0, error.retryAt);
+      throw error;
     }
   }
 
@@ -227,7 +260,8 @@ class BookOrbitApi {
 
   progressClockOffset(date, started) {
     const serverTime = Date.parse(date);
-    return Number.isFinite(serverTime) ? Math.round(serverTime + 500 - (started + Date.now()) / 2) : 0;
+    if (Number.isFinite(serverTime)) this.progressClockSkew = Math.round(serverTime + 500 - (started + Date.now()) / 2);
+    return this.progressClockSkew ?? 0;
   }
 
   async writeProgress(fileId, format, pending, clockOffset, signal) {
@@ -239,7 +273,10 @@ class BookOrbitApi {
       return { status: "saved" };
     }
     const body = { writes: [{ fileId, kind: "text", percentage, text, editedAt: new Date(editedAt + clockOffset).toISOString() }] };
-    const response = parseJson((await this.request("/reading-progress", { method: "PUT", body, signal })).bytes);
+    const started = Date.now();
+    const { bytes, date } = await this.request("/reading-progress", { method: "PUT", body, signal });
+    this.progressClockOffset(date, started);
+    const response = parseJson(bytes);
     const result = Array.isArray(response?.results) && response.results.find(item => item?.fileId === fileId);
     if (!["saved", "superseded"].includes(result?.status)) throw new Error("BookOrbit 未确认阅读进度已保存。");
     return { status: result.status, progress: normalizeReadingProgress(result.progress, true) };
