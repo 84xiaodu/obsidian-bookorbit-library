@@ -11,6 +11,13 @@ const BUNDLE = () => require("../reader-deps/reader-engines.mjs");
 const annotationOperations = new WeakSet();
 const progressOperations = new WeakMap();
 const progressWrites = new WeakMap();
+const nextAutomaticProgress = new WeakMap();
+const PROGRESS_BATCH_MS = 8_000;
+const PROGRESS_INTERVAL_MS = 30_000;
+
+function automaticProgressAt(api) {
+  return Math.max(nextAutomaticProgress.get(api) ?? 0, api.rateLimitUntil ?? 0);
+}
 
 function samePosition(left, right) {
   left = left?.cfi || left;
@@ -873,14 +880,13 @@ class ReaderView extends ItemView {
 
   async onClose() {
     this.closed = true;
-    clearTimeout(this.progressTimer);
     this.engine?.close();
     this.plugin.readerClosed?.(this);
     if (this.positionTimer) {
       clearTimeout(this.positionTimer);
       await this.persist().catch(error => new Notice(error.message, 8500));
     }
-    if (this.progressRecord?.pending && !this.progressWriteDenied) void this.syncProgress();
+    this.scheduleProgress();
   }
 
   marks() {
@@ -934,11 +940,20 @@ class ReaderView extends ItemView {
     return true;
   }
 
-  scheduleProgress() {
-    clearTimeout(this.progressTimer);
-    if (this.api?.readProgress && !this.progressWriteDenied) {
-      this.progressTimer = setTimeout(() => void this.syncProgress(), 1800);
-    }
+  scheduleProgress(delay = PROGRESS_BATCH_MS) {
+    const api = this.api;
+    if (this.progressTimer != null || !this.progressRecord?.pending || !api?.readProgress || api.signal?.aborted || this.progressWriteDenied) return;
+    const wait = Math.max(delay, automaticProgressAt(api) - Date.now());
+    const cancel = () => {
+      clearTimeout(this.progressTimer);
+      this.progressTimer = null;
+    };
+    this.progressTimer = setTimeout(() => {
+      this.progressTimer = null;
+      api.signal?.removeEventListener("abort", cancel);
+      if (!api.signal?.aborted) void this.syncProgress();
+    }, Math.min(wait, 2_147_483_647));
+    api.signal?.addEventListener("abort", cancel, { once: true });
   }
 
   async resumeProgress() {
@@ -975,15 +990,15 @@ class ReaderView extends ItemView {
           if (!this.closed) new Notice("阅读进度已留在本地。请检查 BookOrbit 账号或 API Key 的读写权限。");
         }
         this.progressWriteDenied = true;
-      } else if (manual && !this.closed) new Notice("无法同步阅读进度。 " + error.message);
+      } else {
+        if (error.status === 429) this.scheduleProgress(0);
+        if (manual && !this.closed) new Notice("无法同步阅读进度。 " + error.message);
+      }
     } finally {
       this.syncingProgress = false;
       if (this.resyncProgress) {
         this.resyncProgress = false;
-        if (this.progressRecord.pending && !this.progressWriteDenied) {
-          if (this.closed) void this.syncProgress();
-          else this.scheduleProgress();
-        }
+        this.scheduleProgress();
       }
     }
   }
@@ -1000,19 +1015,34 @@ class ReaderView extends ItemView {
     };
     const queued = (progressOperations.get(record) ?? Promise.resolve()).catch(() => {}).then(async () => {
       signal.throwIfAborted();
-      const remote = await this.api.readProgress(this.fileId, signal);
-      signal.throwIfAborted();
-      const position = cloudPosition(remote, this.format, this.state.positions[this.slot]);
+      const automatic = !resume && !manual;
+      if (automatic) {
+        if (!record.pending || this.progressWriteDenied || this.api.signal?.aborted) return null;
+        const now = Date.now();
+        if (now < automaticProgressAt(this.api)) {
+          this.scheduleProgress(0);
+          return null;
+        }
+        nextAutomaticProgress.set(this.api, now + PROGRESS_INTERVAL_MS);
+      }
       let pending = record.pending;
       const previousWrite = progressWrites.get(record);
-      const ownUpdate = previousWrite && (!previousWrite.updatedAt || remote.updatedAt === previousWrite.updatedAt)
-        && (this.format === "pdf" ? remote.page === previousWrite.position.page : remote.cfi === previousWrite.position);
-      const clockOffset = pending && ownUpdate ? Math.max(remote.clockOffset, remote.updatedAt - pending.editedAt) : remote.clockOffset;
-      if (position && (!pending || remote.updatedAt > pending.editedAt + clockOffset)) {
-        return remember(position, pending);
+      let clockOffset;
+      if (automatic && this.api.progressProtocol === "modern") {
+        // The new endpoint compares editedAt and returns the newer position on conflict.
+        clockOffset = Math.max(this.api.progressClockSkew ?? 0, (previousWrite?.updatedAt ?? 0) - pending.editedAt);
+      } else {
+        const remote = await this.api.readProgress(this.fileId, signal);
+        signal.throwIfAborted();
+        const position = cloudPosition(remote, this.format, this.state.positions[this.slot]);
+        pending = record.pending;
+        const ownUpdate = previousWrite && (!previousWrite.updatedAt || remote.updatedAt === previousWrite.updatedAt)
+          && (this.format === "pdf" ? remote.page === previousWrite.position.page : remote.cfi === previousWrite.position);
+        clockOffset = pending && ownUpdate ? Math.max(remote.clockOffset, remote.updatedAt - pending.editedAt) : remote.clockOffset;
+        if (position && (!pending || remote.updatedAt > pending.editedAt + clockOffset)) return remember(position, pending);
+        if (resume) return null;
+        if (!pending && manual && this.queueProgress()) pending = record.pending;
       }
-      if (resume) return null;
-      if (!pending && manual && this.queueProgress()) pending = record.pending;
       if (!pending) return null;
       await this.persist();
       signal.throwIfAborted();
